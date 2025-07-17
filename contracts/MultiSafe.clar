@@ -8,9 +8,16 @@
 (define-constant ERR_TRANSACTION_EXECUTED (err u107))
 (define-constant ERR_INVALID_AMOUNT (err u108))
 (define-constant ERR_INSUFFICIENT_BALANCE (err u109))
+(define-constant ERR_SCHEDULED_TRANSACTION_NOT_FOUND (err u110))
+(define-constant ERR_TRANSACTION_NOT_READY (err u111))
+(define-constant ERR_TRANSACTION_EXPIRED (err u112))
+(define-constant ERR_INVALID_DELAY (err u113))
+(define-constant ERR_SCHEDULED_TRANSACTION_CANCELLED (err u114))
+(define-constant ERR_CANNOT_CANCEL_AFTER_READY (err u115))
 
 (define-data-var wallet-nonce uint u0)
 (define-data-var transaction-nonce uint u0)
+(define-data-var scheduled-transaction-nonce uint u0)
 
 (define-map wallets
   { wallet-id: uint }
@@ -47,6 +54,38 @@
   { confirmed: bool }
 )
 
+(define-map scheduled-transactions
+  { scheduled-transaction-id: uint }
+  {
+    wallet-id: uint,
+    to: principal,
+    amount: uint,
+    memo: (string-ascii 100),
+    execution-height: uint,
+    expiration-height: uint,
+    confirmations: uint,
+    executed: bool,
+    cancelled: bool,
+    created-by: principal,
+    created-at: uint
+  }
+)
+
+(define-map scheduled-transaction-confirmations
+  { scheduled-transaction-id: uint, owner: principal }
+  { confirmed: bool }
+)
+
+(define-map wallet-time-lock-config
+  { wallet-id: uint }
+  {
+    min-delay-blocks: uint,
+    max-delay-blocks: uint,
+    cancellation-window-blocks: uint,
+    auto-execute-enabled: bool
+  }
+)
+
 (define-public (create-wallet (owners (list 10 principal)) (threshold uint))
   (let
     (
@@ -69,7 +108,18 @@
       }
     )
     
-    ;; (map set-owner-status owners wallet-id)
+    (fold set-owner-status-iter owners wallet-id)
+    
+    (map-set wallet-time-lock-config
+      { wallet-id: wallet-id }
+      {
+        min-delay-blocks: u144,
+        max-delay-blocks: u4320,
+        cancellation-window-blocks: u144,
+        auto-execute-enabled: true
+      }
+    )
+    
     (var-set wallet-nonce wallet-id)
     (ok wallet-id)
   )
@@ -79,6 +129,13 @@
   (map-set wallet-owners
     { wallet-id: wallet-id, owner: owner }
     { is-owner: true }
+  )
+)
+
+(define-private (set-owner-status-iter (owner principal) (wallet-id uint))
+  (begin
+    (set-owner-status owner wallet-id)
+    wallet-id
   )
 )
 
@@ -213,6 +270,147 @@
   )
 )
 
+(define-public (configure-wallet-timelock (wallet-id uint) (min-delay-blocks uint) (max-delay-blocks uint) (cancellation-window-blocks uint) (auto-execute-enabled bool))
+  (let
+    (
+      (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) ERR_WALLET_NOT_FOUND))
+    )
+    (asserts! (is-wallet-owner wallet-id tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (> min-delay-blocks u0) ERR_INVALID_DELAY)
+    (asserts! (>= max-delay-blocks min-delay-blocks) ERR_INVALID_DELAY)
+    (asserts! (> cancellation-window-blocks u0) ERR_INVALID_DELAY)
+    
+    (map-set wallet-time-lock-config
+      { wallet-id: wallet-id }
+      {
+        min-delay-blocks: min-delay-blocks,
+        max-delay-blocks: max-delay-blocks,
+        cancellation-window-blocks: cancellation-window-blocks,
+        auto-execute-enabled: auto-execute-enabled
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (schedule-transaction (wallet-id uint) (to principal) (amount uint) (memo (string-ascii 100)) (delay-blocks uint))
+  (let
+    (
+      (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) ERR_WALLET_NOT_FOUND))
+      (timelock-config (unwrap! (map-get? wallet-time-lock-config { wallet-id: wallet-id }) ERR_WALLET_NOT_FOUND))
+      (scheduled-transaction-id (+ (var-get scheduled-transaction-nonce) u1))
+      (execution-height (+ stacks-block-height delay-blocks))
+      (expiration-height (+ execution-height (get cancellation-window-blocks timelock-config)))
+    )
+    (asserts! (is-wallet-owner wallet-id tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= (get balance wallet) amount) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (>= delay-blocks (get min-delay-blocks timelock-config)) ERR_INVALID_DELAY)
+    (asserts! (<= delay-blocks (get max-delay-blocks timelock-config)) ERR_INVALID_DELAY)
+    
+    (map-set scheduled-transactions
+      { scheduled-transaction-id: scheduled-transaction-id }
+      {
+        wallet-id: wallet-id,
+        to: to,
+        amount: amount,
+        memo: memo,
+        execution-height: execution-height,
+        expiration-height: expiration-height,
+        confirmations: u1,
+        executed: false,
+        cancelled: false,
+        created-by: tx-sender,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (map-set scheduled-transaction-confirmations
+      { scheduled-transaction-id: scheduled-transaction-id, owner: tx-sender }
+      { confirmed: true }
+    )
+    
+    (var-set scheduled-transaction-nonce scheduled-transaction-id)
+    (ok scheduled-transaction-id)
+  )
+)
+
+(define-public (confirm-scheduled-transaction (scheduled-transaction-id uint))
+  (let
+    (
+      (scheduled-transaction (unwrap! (map-get? scheduled-transactions { scheduled-transaction-id: scheduled-transaction-id }) ERR_SCHEDULED_TRANSACTION_NOT_FOUND))
+      (wallet-id (get wallet-id scheduled-transaction))
+    )
+    (asserts! (is-wallet-owner wallet-id tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get executed scheduled-transaction)) ERR_TRANSACTION_EXECUTED)
+    (asserts! (not (get cancelled scheduled-transaction)) ERR_SCHEDULED_TRANSACTION_CANCELLED)
+    (asserts! (is-none (map-get? scheduled-transaction-confirmations { scheduled-transaction-id: scheduled-transaction-id, owner: tx-sender })) ERR_ALREADY_CONFIRMED)
+    
+    (map-set scheduled-transaction-confirmations
+      { scheduled-transaction-id: scheduled-transaction-id, owner: tx-sender }
+      { confirmed: true }
+    )
+    
+    (map-set scheduled-transactions
+      { scheduled-transaction-id: scheduled-transaction-id }
+      (merge scheduled-transaction { confirmations: (+ (get confirmations scheduled-transaction) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-scheduled-transaction (scheduled-transaction-id uint))
+  (let
+    (
+      (scheduled-transaction (unwrap! (map-get? scheduled-transactions { scheduled-transaction-id: scheduled-transaction-id }) ERR_SCHEDULED_TRANSACTION_NOT_FOUND))
+      (wallet-id (get wallet-id scheduled-transaction))
+    )
+    (asserts! (is-wallet-owner wallet-id tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get executed scheduled-transaction)) ERR_TRANSACTION_EXECUTED)
+    (asserts! (not (get cancelled scheduled-transaction)) ERR_SCHEDULED_TRANSACTION_CANCELLED)
+    (asserts! (< stacks-block-height (get execution-height scheduled-transaction)) ERR_CANNOT_CANCEL_AFTER_READY)
+    
+    (map-set scheduled-transactions
+      { scheduled-transaction-id: scheduled-transaction-id }
+      (merge scheduled-transaction { cancelled: true })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (execute-scheduled-transaction (scheduled-transaction-id uint))
+  (let
+    (
+      (scheduled-transaction (unwrap! (map-get? scheduled-transactions { scheduled-transaction-id: scheduled-transaction-id }) ERR_SCHEDULED_TRANSACTION_NOT_FOUND))
+      (wallet (unwrap! (map-get? wallets { wallet-id: (get wallet-id scheduled-transaction) }) ERR_WALLET_NOT_FOUND))
+      (wallet-id (get wallet-id scheduled-transaction))
+    )
+    (asserts! (is-wallet-owner wallet-id tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get executed scheduled-transaction)) ERR_TRANSACTION_EXECUTED)
+    (asserts! (not (get cancelled scheduled-transaction)) ERR_SCHEDULED_TRANSACTION_CANCELLED)
+    (asserts! (>= stacks-block-height (get execution-height scheduled-transaction)) ERR_TRANSACTION_NOT_READY)
+    (asserts! (< stacks-block-height (get expiration-height scheduled-transaction)) ERR_TRANSACTION_EXPIRED)
+    (asserts! (>= (get confirmations scheduled-transaction) (get threshold wallet)) ERR_INSUFFICIENT_CONFIRMATIONS)
+    (asserts! (>= (get balance wallet) (get amount scheduled-transaction)) ERR_INSUFFICIENT_BALANCE)
+    
+    (try! (as-contract (stx-transfer? (get amount scheduled-transaction) tx-sender (get to scheduled-transaction))))
+    
+    (map-set scheduled-transactions
+      { scheduled-transaction-id: scheduled-transaction-id }
+      (merge scheduled-transaction { executed: true })
+    )
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { balance: (- (get balance wallet) (get amount scheduled-transaction)) })
+    )
+    
+    (ok true)
+  )
+)
+
 (define-read-only (get-wallet (wallet-id uint))
   (map-get? wallets { wallet-id: wallet-id })
 )
@@ -241,5 +439,41 @@
   (match (map-get? wallets { wallet-id: wallet-id })
     wallet (some (get balance wallet))
     none
+  )
+)
+
+(define-read-only (get-scheduled-transaction (scheduled-transaction-id uint))
+  (map-get? scheduled-transactions { scheduled-transaction-id: scheduled-transaction-id })
+)
+
+(define-read-only (get-wallet-timelock-config (wallet-id uint))
+  (map-get? wallet-time-lock-config { wallet-id: wallet-id })
+)
+
+(define-read-only (has-confirmed-scheduled-transaction (scheduled-transaction-id uint) (owner principal))
+  (default-to false (get confirmed (map-get? scheduled-transaction-confirmations { scheduled-transaction-id: scheduled-transaction-id, owner: owner })))
+)
+
+(define-read-only (get-scheduled-transaction-count)
+  (var-get scheduled-transaction-nonce)
+)
+
+(define-read-only (is-scheduled-transaction-ready (scheduled-transaction-id uint))
+  (match (map-get? scheduled-transactions { scheduled-transaction-id: scheduled-transaction-id })
+    scheduled-transaction 
+      (and 
+        (>= stacks-block-height (get execution-height scheduled-transaction))
+        (< stacks-block-height (get expiration-height scheduled-transaction))
+        (not (get executed scheduled-transaction))
+        (not (get cancelled scheduled-transaction))
+      )
+    false
+  )
+)
+
+(define-read-only (is-scheduled-transaction-expired (scheduled-transaction-id uint))
+  (match (map-get? scheduled-transactions { scheduled-transaction-id: scheduled-transaction-id })
+    scheduled-transaction (>= stacks-block-height (get expiration-height scheduled-transaction))
+    false
   )
 )
