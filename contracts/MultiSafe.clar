@@ -14,10 +14,19 @@
 (define-constant ERR_INVALID_DELAY (err u113))
 (define-constant ERR_SCHEDULED_TRANSACTION_CANCELLED (err u114))
 (define-constant ERR_CANNOT_CANCEL_AFTER_READY (err u115))
+(define-constant ERR_PROPOSAL_NOT_FOUND (err u116))
+(define-constant ERR_ALREADY_VOTED (err u117))
+(define-constant ERR_PROPOSAL_EXPIRED (err u118))
+(define-constant ERR_PROPOSAL_NOT_READY (err u119))
+(define-constant ERR_PROPOSAL_ALREADY_EXECUTED (err u120))
+(define-constant ERR_INSUFFICIENT_VOTES (err u121))
+(define-constant ERR_INVALID_PROPOSAL_TYPE (err u122))
+(define-constant ERR_INVALID_VOTING_PERIOD (err u123))
 
 (define-data-var wallet-nonce uint u0)
 (define-data-var transaction-nonce uint u0)
 (define-data-var scheduled-transaction-nonce uint u0)
+(define-data-var proposal-nonce uint u0)
 
 (define-map wallets
   { wallet-id: uint }
@@ -84,6 +93,30 @@
     cancellation-window-blocks: uint,
     auto-execute-enabled: bool
   }
+)
+
+(define-map proposals
+  { proposal-id: uint }
+  {
+    wallet-id: uint,
+    proposal-type: uint,
+    proposal-data: (string-ascii 200),
+    new-threshold: (optional uint),
+    new-owners: (optional (list 10 principal)),
+    new-min-delay: (optional uint),
+    new-max-delay: (optional uint),
+    voting-period-end: uint,
+    yes-votes: uint,
+    no-votes: uint,
+    executed: bool,
+    created-by: principal,
+    created-at: uint
+  }
+)
+
+(define-map proposal-votes
+  { proposal-id: uint, voter: principal }
+  { vote: bool }
 )
 
 (define-public (create-wallet (owners (list 10 principal)) (threshold uint))
@@ -477,3 +510,209 @@
     false
   )
 )
+
+(define-public (create-proposal (wallet-id uint) (proposal-type uint) (proposal-data (string-ascii 200)) (voting-period-blocks uint) (new-threshold (optional uint)) (new-owners (optional (list 10 principal))) (new-min-delay (optional uint)) (new-max-delay (optional uint)))
+  (let
+    (
+      (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) ERR_WALLET_NOT_FOUND))
+      (proposal-id (+ (var-get proposal-nonce) u1))
+      (voting-end (+ stacks-block-height voting-period-blocks))
+    )
+    (asserts! (is-wallet-owner wallet-id tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (and (>= proposal-type u1) (<= proposal-type u3)) ERR_INVALID_PROPOSAL_TYPE)
+    (asserts! (> voting-period-blocks u0) ERR_INVALID_VOTING_PERIOD)
+    (asserts! (<= voting-period-blocks u10080) ERR_INVALID_VOTING_PERIOD)
+    
+    (map-set proposals
+      { proposal-id: proposal-id }
+      {
+        wallet-id: wallet-id,
+        proposal-type: proposal-type,
+        proposal-data: proposal-data,
+        new-threshold: new-threshold,
+        new-owners: new-owners,
+        new-min-delay: new-min-delay,
+        new-max-delay: new-max-delay,
+        voting-period-end: voting-end,
+        yes-votes: u0,
+        no-votes: u0,
+        executed: false,
+        created-by: tx-sender,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (var-set proposal-nonce proposal-id)
+    (ok proposal-id)
+  )
+)
+
+(define-public (vote-on-proposal (proposal-id uint) (vote bool))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+      (wallet-id (get wallet-id proposal))
+    )
+    (asserts! (is-wallet-owner wallet-id tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (< stacks-block-height (get voting-period-end proposal)) ERR_PROPOSAL_EXPIRED)
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_ALREADY_EXECUTED)
+    (asserts! (is-none (map-get? proposal-votes { proposal-id: proposal-id, voter: tx-sender })) ERR_ALREADY_VOTED)
+    
+    (map-set proposal-votes
+      { proposal-id: proposal-id, voter: tx-sender }
+      { vote: vote }
+    )
+    
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (if vote
+        (merge proposal { yes-votes: (+ (get yes-votes proposal) u1) })
+        (merge proposal { no-votes: (+ (get no-votes proposal) u1) })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+      (wallet (unwrap! (map-get? wallets { wallet-id: (get wallet-id proposal) }) ERR_WALLET_NOT_FOUND))
+      (wallet-id (get wallet-id proposal))
+      (owners-count (len (get owners wallet)))
+      (required-votes (+ (/ owners-count u2) u1))
+    )
+    (asserts! (is-wallet-owner wallet-id tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (>= stacks-block-height (get voting-period-end proposal)) ERR_PROPOSAL_NOT_READY)
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_ALREADY_EXECUTED)
+    (asserts! (>= (get yes-votes proposal) required-votes) ERR_INSUFFICIENT_VOTES)
+    (asserts! (> (get yes-votes proposal) (get no-votes proposal)) ERR_INSUFFICIENT_VOTES)
+    
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal { executed: true })
+    )
+    
+    (if (is-eq (get proposal-type proposal) u1)
+      (execute-threshold-change-proposal wallet-id proposal)
+      (if (is-eq (get proposal-type proposal) u2)
+        (execute-owners-change-proposal wallet-id proposal)
+        (execute-timelock-change-proposal wallet-id proposal)
+      )
+    )
+  )
+)
+
+(define-private (execute-threshold-change-proposal (wallet-id uint) (proposal { wallet-id: uint, proposal-type: uint, proposal-data: (string-ascii 200), new-threshold: (optional uint), new-owners: (optional (list 10 principal)), new-min-delay: (optional uint), new-max-delay: (optional uint), voting-period-end: uint, yes-votes: uint, no-votes: uint, executed: bool, created-by: principal, created-at: uint }))
+  (let
+    (
+      (wallet (unwrap-panic (map-get? wallets { wallet-id: wallet-id })))
+      (new-threshold-value (unwrap-panic (get new-threshold proposal)))
+    )
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { threshold: new-threshold-value })
+    )
+    (ok true)
+  )
+)
+
+(define-private (execute-owners-change-proposal (wallet-id uint) (proposal { wallet-id: uint, proposal-type: uint, proposal-data: (string-ascii 200), new-threshold: (optional uint), new-owners: (optional (list 10 principal)), new-min-delay: (optional uint), new-max-delay: (optional uint), voting-period-end: uint, yes-votes: uint, no-votes: uint, executed: bool, created-by: principal, created-at: uint }))
+  (let
+    (
+      (wallet (unwrap-panic (map-get? wallets { wallet-id: wallet-id })))
+      (new-owners-list (unwrap-panic (get new-owners proposal)))
+    )
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { owners: new-owners-list })
+    )
+    (fold set-owner-status-iter new-owners-list wallet-id)
+    (ok true)
+  )
+)
+
+(define-private (execute-timelock-change-proposal (wallet-id uint) (proposal { wallet-id: uint, proposal-type: uint, proposal-data: (string-ascii 200), new-threshold: (optional uint), new-owners: (optional (list 10 principal)), new-min-delay: (optional uint), new-max-delay: (optional uint), voting-period-end: uint, yes-votes: uint, no-votes: uint, executed: bool, created-by: principal, created-at: uint }))
+  (let
+    (
+      (current-config (unwrap-panic (map-get? wallet-time-lock-config { wallet-id: wallet-id })))
+      (new-min-delay-value (unwrap-panic (get new-min-delay proposal)))
+      (new-max-delay-value (unwrap-panic (get new-max-delay proposal)))
+    )
+    (map-set wallet-time-lock-config
+      { wallet-id: wallet-id }
+      (merge current-config { min-delay-blocks: new-min-delay-value, max-delay-blocks: new-max-delay-value })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-proposal (proposal-id uint))
+  (map-get? proposals { proposal-id: proposal-id })
+)
+
+(define-read-only (get-proposal-count)
+  (var-get proposal-nonce)
+)
+
+(define-read-only (has-voted-on-proposal (proposal-id uint) (voter principal))
+  (is-some (map-get? proposal-votes { proposal-id: proposal-id, voter: voter }))
+)
+
+(define-read-only (get-voter-choice (proposal-id uint) (voter principal))
+  (match (map-get? proposal-votes { proposal-id: proposal-id, voter: voter })
+    vote-data (some (get vote vote-data))
+    none
+  )
+)
+
+(define-read-only (is-proposal-ready-for-execution (proposal-id uint))
+  (match (map-get? proposals { proposal-id: proposal-id })
+    proposal
+      (let
+        (
+          (wallet (unwrap-panic (map-get? wallets { wallet-id: (get wallet-id proposal) })))
+          (owners-count (len (get owners wallet)))
+          (required-votes (+ (/ owners-count u2) u1))
+        )
+        (and
+          (>= stacks-block-height (get voting-period-end proposal))
+          (not (get executed proposal))
+          (>= (get yes-votes proposal) required-votes)
+          (> (get yes-votes proposal) (get no-votes proposal))
+        )
+      )
+    false
+  )
+)
+
+(define-read-only (get-proposal-vote-status (proposal-id uint))
+  (match (map-get? proposals { proposal-id: proposal-id })
+    proposal
+      (let
+        (
+          (wallet (unwrap-panic (map-get? wallets { wallet-id: (get wallet-id proposal) })))
+          (owners-count (len (get owners wallet)))
+          (required-votes (+ (/ owners-count u2) u1))
+        )
+        (some {
+          yes-votes: (get yes-votes proposal),
+          no-votes: (get no-votes proposal),
+          required-votes: required-votes,
+          total-owners: owners-count,
+          voting-ends: (get voting-period-end proposal),
+          can-execute: (and
+            (>= stacks-block-height (get voting-period-end proposal))
+            (not (get executed proposal))
+            (>= (get yes-votes proposal) required-votes)
+            (> (get yes-votes proposal) (get no-votes proposal))
+          )
+        })
+      )
+    none
+  )
+)
+
+
